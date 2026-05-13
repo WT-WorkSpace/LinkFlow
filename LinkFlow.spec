@@ -29,10 +29,9 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
+# Windows .exe icon when icon\link.ico exists in repo
+_exe_icon = _root / "icon" / "link.ico"
+_exe_kw = dict(
     exclude_binaries=True,
     name="LinkFlow",
     debug=False,
@@ -46,6 +45,10 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+if _exe_icon.is_file():
+    _exe_kw["icon"] = str(_exe_icon)
+
+exe = EXE(pyz, a.scripts, [], **_exe_kw)
 
 coll = COLLECT(
     exe,

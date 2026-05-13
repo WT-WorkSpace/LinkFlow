@@ -2121,9 +2121,17 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication([])
     app.setApplicationName("LinkFlow")
-    _icon_path = _resource_dir() / "icon" / "link.svg"
-    if _icon_path.is_file():
-        app.setWindowIcon(QIcon(str(_icon_path)))
+    _app_icon: Path | None = None
+    for _name in ("link.ico", "link.svg"):
+        for _base in (_writable_app_dir(), _resource_dir()):
+            _p = _base / "icon" / _name
+            if _p.is_file():
+                _app_icon = _p
+                break
+        if _app_icon is not None:
+            break
+    if _app_icon is not None:
+        app.setWindowIcon(QIcon(str(_app_icon)))
     win = MainWindow()
     win.show()
     app.exec()
