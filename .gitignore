@@ -11,4 +11,5 @@ data/
 *vscode
 dist/
 .spec
-hosts.json
+*.json
+**hosts**

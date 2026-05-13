@@ -14,6 +14,7 @@ import shutil
 import stat
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -89,6 +90,11 @@ def _mtime_str(ts: float | int) -> str:
         return "—"
 
 
+def _log_timestamp() -> str:
+    """传输日志行首时间戳。"""
+    return datetime.now().strftime("【%Y-%m-%d %H:%M:%S】")
+
+
 ROLE_PATH = Qt.ItemDataRole.UserRole
 ROLE_IS_DIR = Qt.ItemDataRole.UserRole + 1
 ROLE_JOB_ID = Qt.ItemDataRole.UserRole
@@ -97,6 +103,9 @@ ROLE_BATCH_ID = Qt.ItemDataRole.UserRole + 10
 ROLE_XFER_DIR = Qt.ItemDataRole.UserRole + 20
 ROLE_XFER_SP = Qt.ItemDataRole.UserRole + 21
 ROLE_XFER_DP = Qt.ItemDataRole.UserRole + 22
+# 传输表名称列：日志用「源/目标」端点描述（预设名、IP、本机等）
+ROLE_XFER_LOG_SRC = Qt.ItemDataRole.UserRole + 30
+ROLE_XFER_LOG_DST = Qt.ItemDataRole.UserRole + 31
 
 # 预设下拉框中「本机模式」条目的 itemData 标记（与 SSH 预设 dict 区分）
 PRESET_COMBO_DATA_LOCAL = "__local_disk__"
@@ -425,12 +434,20 @@ class SidePane(QWidget):
         if not self.ed_path.text().strip():
             self.ed_path.setText(os.path.expanduser("~"))
         if self._main:
+            cur = self.ed_path.text().strip() or os.path.expanduser("~")
+            self._main._append_log(
+                f"[{self.label}] 本机已连接，浏览路径：{cur}"
+            )
             self._main.refresh_list(self)
 
     def _leave_local_mode(self) -> None:
         self.is_local = False
         self.lbl_status.setText("状态：未连接")
         self.lbl_status.setStyleSheet("color: gray;")
+        if self._main:
+            self._main._append_log(
+                f"[{self.label}] 本机已断开（已切换为手动输入或其它 SSH 预设）"
+            )
 
     def _on_save_preset_clicked(self) -> None:
         if self._main:
@@ -497,6 +514,35 @@ class SidePane(QWidget):
             if p:
                 out.append((str(p), bool(it.data(0, ROLE_IS_DIR))))
         return out
+
+
+def _xfer_log_endpoint(pane: SidePane) -> str:
+    """传输日志中的端点描述：本机、预设别名、或 user@host:port。"""
+    if pane.local_checked():
+        return "本机"
+    host = pane.ed_host.text().strip()
+    try:
+        port = int((pane.ed_port.text() or "22").strip() or "22")
+    except ValueError:
+        port = 22
+    user = (pane.ed_user.text() or "").strip()
+    if host and user:
+        base = f"{user}@{host}:{port}"
+    elif host:
+        base = f"{host}:{port}"
+    else:
+        base = ""
+
+    dev = pane.active_preset_device()
+    if isinstance(dev, dict):
+        nm = str(dev.get("name", "")).strip()
+        if nm:
+            if base and nm != host:
+                return f"{nm}({base})"
+            if base:
+                return base
+            return nm
+    return base or pane.label
 
 
 class MainWindow(QMainWindow):
@@ -673,10 +719,51 @@ class MainWindow(QMainWindow):
                 return row
         return None
 
+    def _xfer_batch_route_log(self, batch_id: str) -> str:
+        """从表格元数据取该批次的源→目标端点描述（用于汇总日志）。"""
+        for row in range(self.table_jobs.rowCount()):
+            it0 = self.table_jobs.item(row, XFER_JOB_COL_NAME)
+            if it0 and str(it0.data(ROLE_BATCH_ID)) == str(batch_id):
+                ls = it0.data(ROLE_XFER_LOG_SRC)
+                ld = it0.data(ROLE_XFER_LOG_DST)
+                if ls is not None and ld is not None:
+                    return f"{ls} → {ld}"
+                break
+        return f"批次 {batch_id}"
+
     def _append_log(self, line: str) -> None:
-        self.txt_log.appendPlainText(line)
+        self.txt_log.appendPlainText(f"{_log_timestamp()} {line}")
         sb = self.txt_log.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _log_xfer_job_state_line(self, job_id: str, state_text: str) -> None:
+        """为单文件传输终态写入传输日志（避免「传输中」刷屏）。"""
+        if state_text == "传输中":
+            return
+        if state_text not in (
+            "传输成功",
+            "已中止",
+            "已取消",
+            "已移除",
+            "已跳过",
+        ) and not state_text.startswith("失败"):
+            return
+        row = self._job_row(job_id)
+        disp = job_id
+        route = ""
+        if row is not None:
+            it = self.table_jobs.item(row, XFER_JOB_COL_NAME)
+            if it is not None and it.text():
+                disp = it.text()
+            if it is not None:
+                ls = it.data(ROLE_XFER_LOG_SRC)
+                ld = it.data(ROLE_XFER_LOG_DST)
+                if ls is not None and ld is not None:
+                    route = f"{ls} → {ld}"
+        if route:
+            self._append_log(f"「{disp}」({job_id}) [{route}] {state_text}")
+        else:
+            self._append_log(f"「{disp}」({job_id}) {state_text}")
 
     def show_pane_file_context_menu(self, pane: SidePane, pos) -> None:
         item = pane.tree.itemAt(pos)
@@ -868,6 +955,8 @@ class MainWindow(QMainWindow):
                 elif kind == "batch_prepared":
                     batch_id, job_rows, src, dst, sl, dl = payload
                     route_txt = f"{src.label} → {dst.label}"
+                    log_src = _xfer_log_endpoint(src)
+                    log_dst = _xfer_log_endpoint(dst)
                     for jid, name, fsz, sp, dp in job_rows:
                         row = self.table_jobs.rowCount()
                         self.table_jobs.insertRow(row)
@@ -877,6 +966,8 @@ class MainWindow(QMainWindow):
                         it0.setData(ROLE_XFER_DIR, "out_to_in" if src is self.pane_out else "in_to_out")
                         it0.setData(ROLE_XFER_SP, sp)
                         it0.setData(ROLE_XFER_DP, dp)
+                        it0.setData(ROLE_XFER_LOG_SRC, log_src)
+                        it0.setData(ROLE_XFER_LOG_DST, log_dst)
                         it0.setToolTip(sp)
                         self.table_jobs.setItem(row, XFER_JOB_COL_NAME, it0)
                         self.table_jobs.setItem(
@@ -900,6 +991,9 @@ class MainWindow(QMainWindow):
                         )
                         self._attach_row_action_button(row, jid)
                     self._xfer_queue.put((batch_id, job_rows, src, dst, sl, dl))
+                    self._append_log(
+                        f"批次 {batch_id} 已就绪：{log_src} → {log_dst}，共 {len(job_rows)} 个文件待传"
+                    )
                 elif kind == "xfer_prep_aborted":
                     idle = self._xfer_decrement_pending()
                     if idle:
@@ -944,23 +1038,31 @@ class MainWindow(QMainWindow):
                         )
                         self._sync_action_button_for_job(job_id)
                         self._sync_progress_bar_for_job(job_id)
+                    self._log_xfer_job_state_line(job_id, state_text)
                 elif kind == "xfer_batch_error":
-                    QMessageBox.critical(self, "传输失败", str(payload))
+                    err = str(payload)
+                    QMessageBox.critical(self, "传输失败", err)
                 elif kind == "xfer_idle":
                     with self._xfer_pending_lock:
                         still_pending = self._xfer_pending_batches
                     if still_pending == 0:
                         self._set_xfer_busy(False)
                         self.lbl_job_summary.setText("就绪")
+                        self._append_log("全部传输批次已结束，已刷新两侧目录列表")
                         self.refresh_list(self.pane_out)
                         self.refresh_list(self.pane_in)
                 elif kind == "connect_done":
                     pane, err, remote_home = payload
+                    ep = _xfer_log_endpoint(pane)
                     if err:
+                        self._append_log(f"[{pane.label}] SSH 连接失败 {ep}：{err}")
                         QMessageBox.critical(self, "连接失败", err)
                         pane.lbl_status.setText("状态：连接失败")
                         pane.lbl_status.setStyleSheet("color: red;")
                     else:
+                        self._append_log(
+                            f"[{pane.label}] SSH 已连接 {ep}（远端主目录：{remote_home or '—'}）"
+                        )
                         pane.lbl_status.setText("状态：已连接")
                         pane.lbl_status.setStyleSheet("color: green;")
                         self._apply_remote_path_after_connect(pane, remote_home)
@@ -985,6 +1087,7 @@ class MainWindow(QMainWindow):
             return self._xfer_pending_batches == 0
 
     def _cancel_waiting_rows_for_batch(self, batch_id: str) -> None:
+        n = 0
         for row in range(self.table_jobs.rowCount()):
             it0 = self.table_jobs.item(row, XFER_JOB_COL_NAME)
             st = self.table_jobs.item(row, XFER_JOB_COL_STATE)
@@ -995,8 +1098,14 @@ class MainWindow(QMainWindow):
                 and st.text() == "等待传输"
             ):
                 st.setText("已取消")
+                n += 1
         self._sync_action_buttons_for_batch(batch_id)
         self._sync_progress_bars_for_batch(batch_id)
+        if n:
+            br = self._xfer_batch_route_log(batch_id)
+            self._append_log(
+                f"{br}：{n} 个等待中的任务已标记为「已取消」（取消传输或批次中断）"
+            )
 
     def _on_cancel(self) -> None:
         self._cancel_event.set()
@@ -1205,6 +1314,7 @@ class MainWindow(QMainWindow):
                     self.table_jobs.removeRow(row)
 
     def _skip_remaining_waiting_in_batch(self, batch_id: str) -> None:
+        n = 0
         for row in range(self.table_jobs.rowCount()):
             it0 = self.table_jobs.item(row, XFER_JOB_COL_NAME)
             st = self.table_jobs.item(row, XFER_JOB_COL_STATE)
@@ -1215,8 +1325,14 @@ class MainWindow(QMainWindow):
                 and st.text() == "等待传输"
             ):
                 st.setText("已跳过")
+                n += 1
         self._sync_action_buttons_for_batch(batch_id)
         self._sync_progress_bars_for_batch(batch_id)
+        if n:
+            br = self._xfer_batch_route_log(batch_id)
+            self._append_log(
+                f"{br}：{n} 个等待中的任务已标记为「已跳过」（因同批次前置任务失败）"
+            )
 
     def _fill_tree(
         self, pane: SidePane, entries: list[tuple[str, bool, int, float, str]]
@@ -1388,6 +1504,10 @@ class MainWindow(QMainWindow):
             pane.is_local = True
             pane.lbl_status.setText("状态：本地模式")
             pane.lbl_status.setStyleSheet("color: green;")
+            cur = pane.ed_path.text().strip() or os.path.expanduser("~")
+            self._append_log(
+                f"[{pane.label}] 本机已连接（连接按钮），浏览路径：{cur}"
+            )
             self.refresh_list(pane)
             return
 
@@ -1416,15 +1536,25 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def disconnect_side(self, pane: SidePane) -> None:
+        was_local = pane.local_checked()
+        had_ssh = pane.sftp is not None or pane.ssh is not None
+        ep_ssh = _xfer_log_endpoint(pane) if had_ssh else ""
         with self._io_lock:
             pane.close_remote()
         pane.is_local = pane.local_checked()
         if pane.is_local:
             pane.lbl_status.setText("状态：本地模式")
             pane.lbl_status.setStyleSheet("color: green;")
+            if was_local:
+                cur = pane.ed_path.text().strip() or "—"
+                self._append_log(
+                    f"[{pane.label}] 本机已断开（仍为本地模式，浏览路径：{cur}）"
+                )
         else:
             pane.lbl_status.setText("状态：未连接")
             pane.lbl_status.setStyleSheet("color: gray;")
+            if had_ssh and ep_ssh and ep_ssh != "本机":
+                self._append_log(f"[{pane.label}] SSH 已断开 {ep_ssh}")
 
     def go_up(self, pane: SidePane) -> None:
         cur = pane.ed_path.text().strip()
@@ -1457,10 +1587,21 @@ class MainWindow(QMainWindow):
                     self._xfer_abort_job_id = None
                 self._run_prepared_batch(batch_id, job_rows, src, dst, sl, dl)
             except InterruptedError:
-                self._msg_queue.put(("log", "当前传输批次已中断（取消或操作中止）"))
+                log_src = _xfer_log_endpoint(src)
+                log_dst = _xfer_log_endpoint(dst)
+                self._msg_queue.put(
+                    (
+                        "log",
+                        f"当前传输批次已中断（{log_src} → {log_dst}）：取消或操作中止",
+                    )
+                )
             except Exception as e:
+                log_src = _xfer_log_endpoint(src)
+                log_dst = _xfer_log_endpoint(dst)
+                self._msg_queue.put(
+                    ("log", f"传输批次失败（{log_src} → {log_dst}）：{e}")
+                )
                 self._msg_queue.put(("xfer_batch_error", str(e)))
-                self._msg_queue.put(("log", f"传输批次错误: {e}"))
                 self._msg_queue.put(("skip_batch_waiting", batch_id))
             finally:
                 with self._xfer_pending_lock:
@@ -1510,11 +1651,13 @@ class MainWindow(QMainWindow):
         batch_id = f"b{self._xfer_batch_seq}"
         self._set_xfer_busy(True)
         lead = f"{log_prefix}：" if log_prefix else ""
+        log_src = _xfer_log_endpoint(src)
+        log_dst = _xfer_log_endpoint(dst)
         self._msg_queue.put(
             (
                 "log",
-                f"{lead}已加入传输队列：{len(paths)} 项（当前共 {n_pending} 个批次）；"
-                f"正在扫描文件夹并列出待传文件…",
+                f"{lead}已加入传输队列：{log_src} → {log_dst}，{len(paths)} 项"
+                f"（当前共 {n_pending} 个批次）；正在扫描文件夹并列出待传文件…",
             )
         )
         threading.Thread(
