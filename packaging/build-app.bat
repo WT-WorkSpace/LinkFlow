@@ -24,7 +24,8 @@ if errorlevel 1 (
 )
 
 echo [LinkFlow] pip install -r requirements.txt
-"%PY%" -m pip install -r "%ROOT%\requirements.txt"
+"%PY%" -m pip uninstall -y PySide6 PySide6_Addons 2>nul
+"%PY%" -m pip install -r "%ROOT%\requirements.txt" "pyinstaller>=6.0"
 if errorlevel 1 (
   echo ERROR: pip install failed.
   exit /b 1
@@ -61,10 +62,19 @@ if errorlevel 1 (
   exit /b 1
 )
 
+set "TGZ=%ROOT%\dist\LinkFlow-windows-amd64.tar.gz"
+if exist "%TGZ%" del /f /q "%TGZ%"
+tar -czf "%TGZ%" -C "%ROOT%\dist" LinkFlow
+if errorlevel 1 (
+  echo WARNING: tar compress failed; ship dist\LinkFlow folder as-is.
+) else (
+  echo [LinkFlow] Archive: %TGZ%
+)
+
 echo.
 echo Done. App folder: %APP%
 echo Run: %APP%\LinkFlow.exe
-echo Ship the whole dist\LinkFlow folder.
+echo Ship dist\LinkFlow folder, or the .tar.gz if created ^(often under 100MB^).
 echo.
 pause
 endlocal

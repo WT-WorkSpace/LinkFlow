@@ -1,8 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 使用 pcdview 中的 Python 执行: python -m PyInstaller LinkFlow.spec
+# 勿使用 collect_all('PySide6')，否则会打入 WebEngine/3D/多媒体等整块 Qt，体积可达 1GB+。
+# 仅打包 main.py 实际用到的模块，由 PyInstaller 的 hook-PySide6 按依赖收集 Qt 库与必要插件。
 from pathlib import Path
-
-from PyInstaller.utils.hooks import collect_all
 
 _root = Path(SPEC).resolve().parent
 
@@ -11,14 +10,12 @@ _datas = []
 if _icon_dir.is_dir():
     _datas.append((str(_icon_dir), "icon"))
 
-_ps_datas, _ps_binaries, _ps_hidden = collect_all("PySide6")
-
 a = Analysis(
     [str(_root / "main.py")],
     pathex=[str(_root)],
-    binaries=_ps_binaries,
-    datas=_datas + _ps_datas,
-    hiddenimports=list(_ps_hidden),
+    binaries=[],
+    datas=_datas,
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -29,14 +26,13 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-# Windows .exe icon when icon\link.ico exists in repo
 _exe_icon = _root / "icon" / "link.ico"
 _exe_kw = dict(
     exclude_binaries=True,
     name="LinkFlow",
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    strip=True,
     upx=False,
     console=False,
     disable_windowed_traceback=False,
@@ -55,7 +51,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=False,
+    strip=True,
     upx=False,
     upx_exclude=[],
     name="LinkFlow",

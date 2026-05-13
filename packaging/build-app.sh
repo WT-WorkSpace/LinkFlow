@@ -17,7 +17,9 @@ fi
 
 echo "使用解释器: $LINKFLOW_BUILD_PYTHON"
 cd "$ROOT"
-"$LINKFLOW_BUILD_PYTHON" -m pip install -q "pyinstaller>=6.0"
+# 若已装过元包 PySide6 / PySide6_Addons，会打进 WebEngine 等，frozen 体积暴增；构建前卸掉，仅保留 requirements 中的 Essentials。
+"$LINKFLOW_BUILD_PYTHON" -m pip uninstall -y PySide6 PySide6_Addons 2>/dev/null || true
+"$LINKFLOW_BUILD_PYTHON" -m pip install -q -r "$ROOT/requirements.txt" "pyinstaller>=6.0"
 "$LINKFLOW_BUILD_PYTHON" -m PyInstaller --noconfirm "$ROOT/LinkFlow.spec"
 
 APPDIR="$ROOT/dist/LinkFlow"
@@ -52,17 +54,24 @@ Categories=Network;
 Keywords=ssh;sftp;transfer;
 EOF
 
-sudo chmod +x "$DESKTOP_IN_DIST"
+chmod +x "$DESKTOP_IN_DIST"
 
 
-# 将 hosts.json 复制到 dist/LinkFlow 目录
-cp "$ROOT/hosts.json" "$APPDIR/hosts.json"
+if [[ -f "$ROOT/hosts.json" ]]; then
+  cp "$ROOT/hosts.json" "$APPDIR/hosts.json"
+fi
 
 mv "$APPDIR/LinkFlow.desktop" "$HOME/Desktop/LinkFlow.desktop"
 
 
+TGZ="$ROOT/dist/LinkFlow-linux-amd64.tar.gz"
+rm -f "$TGZ"
+tar -C "$ROOT/dist" -czf "$TGZ" LinkFlow
+
 echo ""
-echo "应用已生成: $APPDIR"
+echo "应用已生成: $APPDIR ($(du -sh "$APPDIR" | cut -f1) 解压后)"
 echo "  可执行文件: $EXEC"
 echo "  桌面入口（可复制到桌面）: $DESKTOP_IN_DIST"
-echo "分发整个 dist/LinkFlow 文件夹即可；若移动目录，请改 LinkFlow.desktop 中的 Exec、Icon、Path。"
+echo "  压缩分发包（通常 <100MB）: $TGZ ($(du -sh "$TGZ" | cut -f1))"
+echo "解压后体积主要来自 Qt6 + Python + cryptography；分发请优先发 .tar.gz。"
+echo "若移动目录，请改 LinkFlow.desktop 中的 Exec、Icon、Path。"
