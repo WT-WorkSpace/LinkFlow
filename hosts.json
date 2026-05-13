@@ -1,0 +1,13 @@
+{
+  "devices": [
+    {
+      "name": "test",
+      "host": "135.555.555.5",
+      "port": 22,
+      "user": "telangpu",
+      "password": "10086",
+      "key_path": "",
+      "default_path": "/home/telangpu"
+    }
+  ]
+}
