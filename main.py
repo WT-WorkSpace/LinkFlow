@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import sys
 import queue
 import shutil
 import stat
@@ -125,8 +126,22 @@ XFER_JOB_COL_ACTION = 8
 HOSTS_CONFIG_FILENAME = "hosts.json"
 
 
+def _writable_app_dir() -> Path:
+    """hosts.json 所在目录：开发时为项目根；PyInstaller 打包后为可执行文件旁（可写）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _resource_dir() -> Path:
+    """内置资源（图标等）：开发时为项目根；frozen 时为 PyInstaller 的 _MEIPASS。"""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+
 def hosts_config_path() -> Path:
-    return Path(__file__).resolve().parent / HOSTS_CONFIG_FILENAME
+    return _writable_app_dir() / HOSTS_CONFIG_FILENAME
 
 
 def load_host_devices() -> list[dict[str, Any]]:
@@ -2105,6 +2120,10 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication([])
+    app.setApplicationName("LinkFlow")
+    _icon_path = _resource_dir() / "icon" / "link.svg"
+    if _icon_path.is_file():
+        app.setWindowIcon(QIcon(str(_icon_path)))
     win = MainWindow()
     win.show()
     app.exec()

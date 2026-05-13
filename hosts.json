@@ -1,13 +1,22 @@
 {
   "devices": [
     {
-      "name": "test",
-      "host": "135.555.555.5",
+      "name": "tanway-orin",
+      "host": "172.20.4.200",
       "port": 22,
-      "user": "telangpu",
-      "password": "10086",
+      "user": "nvidia",
+      "password": "tanway5250",
       "key_path": "",
-      "default_path": "/home/telangpu"
+      "default_path": "/data/wt_workspace"
+    },
+    {
+      "name": "tanway-v100",
+      "host": "111.13.137.90",
+      "port": 22,
+      "user": "wangtao",
+      "password": " ",
+      "key_path": "",
+      "default_path": ""
     }
   ]
 }
