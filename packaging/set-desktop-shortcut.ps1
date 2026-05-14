@@ -1,35 +1,48 @@
-#requires -Version 5.1
-# Create Desktop\LinkFlow.lnk -> dist\LinkFlow\LinkFlow.exe with icon\link.ico when present.
+# Creates LinkFlow.lnk on the current user's Desktop (respects OneDrive Desktop when configured).
 param(
     [Parameter(Mandatory = $true)]
-    [string]$AppDir
+    [string] $AppDir
 )
+
 $ErrorActionPreference = 'Stop'
 
+function Resolve-DesktopPath {
+    $candidates = @(
+        [Environment]::GetFolderPath('Desktop')
+        (Join-Path $env:USERPROFILE 'Desktop')
+    )
+    if ($env:OneDrive) {
+        $candidates += (Join-Path $env:OneDrive 'Desktop')
+    }
+    if ($env:OneDriveCommercial) {
+        $candidates += (Join-Path $env:OneDriveCommercial 'Desktop')
+    }
+    foreach ($p in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        if (Test-Path -LiteralPath $p) { return (Resolve-Path -LiteralPath $p).Path }
+    }
+    throw "Could not resolve Desktop folder. Tried: $($candidates -join '; ')"
+}
+
 $AppDir = (Resolve-Path -LiteralPath $AppDir).Path
-$ExeName = 'LinkFlow.exe'
-$Exe = Join-Path $AppDir $ExeName
-if (-not (Test-Path -LiteralPath $Exe)) {
-    Write-Error "Missing exe: $Exe"
+$exe = Join-Path $AppDir 'LinkFlow.exe'
+if (-not (Test-Path -LiteralPath $exe)) {
+    throw "Executable not found: $exe"
 }
 
-$desktop = [Environment]::GetFolderPath('Desktop')
-$lnkName = [System.IO.Path]::GetFileNameWithoutExtension($ExeName) + '.lnk'
-$lnkPath = Join-Path $desktop $lnkName
+$desktop = Resolve-DesktopPath
+$lnkPath = Join-Path $desktop 'LinkFlow.lnk'
 
-$icon = Join-Path $AppDir 'icon\link.ico'
-if (-not (Test-Path -LiteralPath $icon)) {
-    $icon = $null
-}
-
-$shell = New-Object -ComObject WScript.Shell
-$sc = $shell.CreateShortcut($lnkPath)
-$sc.TargetPath = $Exe
+$ws = New-Object -ComObject WScript.Shell
+$sc = $ws.CreateShortcut($lnkPath)
+$sc.TargetPath = $exe
 $sc.WorkingDirectory = $AppDir
-$sc.Description = 'LinkFlow'
-if ($null -ne $icon) {
-    $sc.IconLocation = $icon
+$icon = Join-Path $AppDir 'icon\link.ico'
+if (Test-Path -LiteralPath $icon) {
+    $sc.IconLocation = "$icon,0"
 }
+$sc.Description = 'LinkFlow'
 $sc.Save()
 
-Write-Host "Desktop shortcut: $lnkPath"
+Write-Host "[LinkFlow] Shortcut created: $lnkPath"
+exit 0
