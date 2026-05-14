@@ -780,15 +780,60 @@ class MainWindow(QMainWindow):
         else:
             self._append_log(f"「{disp}」({job_id}) {state_text}")
 
+    def _parent_dir_for_new_folder(
+        self, pane: SidePane, paths: list[tuple[str, bool]]
+    ) -> str | None:
+        """新建文件夹的父目录：仅当选中单个文件夹时建在其内，否则建在列表当前路径下。"""
+        if len(paths) == 1 and paths[0][1]:
+            return paths[0][0]
+        cur = pane.ed_path.text().strip()
+        if pane.local_checked():
+            cur = os.path.normpath(os.path.expanduser(cur or "~"))
+            if not os.path.isdir(cur):
+                return None
+            return cur
+        if not pane.sftp:
+            return None
+        cur = posixpath.normpath(cur or "/")
+        try:
+            with self._io_lock:
+                st = pane.sftp.stat(cur)
+            if not stat.S_ISDIR(int(st.st_mode)):
+                return None
+        except OSError:
+            return None
+        return cur
+
     def show_pane_file_context_menu(self, pane: SidePane, pos) -> None:
         item = pane.tree.itemAt(pos)
-        if item is not None:
-            if not item.isSelected():
-                pane.tree.clearSelection()
-                item.setSelected(True)
+        if item is None:
+            pane.tree.clearSelection()
+        elif not item.isSelected():
+            pane.tree.clearSelection()
+            item.setSelected(True)
 
         paths = pane.selected_paths()
+        can_mkdir = bool(pane.local_checked() or pane.sftp is not None)
+        parent_for_mkdir = (
+            self._parent_dir_for_new_folder(pane, paths) if can_mkdir else None
+        )
+
         if not paths:
+            if parent_for_mkdir is None:
+                return
+            menu = QMenu(self)
+            sty = self.style()
+            _mk_pix = getattr(
+                QStyle.StandardPixmap,
+                "SP_FileDialogNewFolder",
+                QStyle.StandardPixmap.SP_DirIcon,
+            )
+            act_mk = QAction(sty.standardIcon(_mk_pix), "新建文件夹", self)
+            act_mk.triggered.connect(
+                lambda _checked=False, p=pane: self._ctx_new_folder_in_pane(p, [])
+            )
+            menu.addAction(act_mk)
+            menu.exec(pane.tree.viewport().mapToGlobal(pos))
             return
 
         menu = QMenu(self)
@@ -823,9 +868,23 @@ class MainWindow(QMainWindow):
             op=old_p,
             isd=is_dir0: self._ctx_rename_in_pane(p, op, isd),
         )
+        _mk_pix = getattr(
+            QStyle.StandardPixmap,
+            "SP_FileDialogNewFolder",
+            QStyle.StandardPixmap.SP_DirIcon,
+        )
+        act_mk = QAction(sty.standardIcon(_mk_pix), "新建文件夹", self)
+        act_mk.setEnabled(parent_for_mkdir is not None)
+        act_mk.triggered.connect(
+            lambda _checked=False, p=pane, s=list(paths): self._ctx_new_folder_in_pane(
+                p, s
+            )
+        )
         menu.addAction(act_send)
         menu.addAction(act_del)
         menu.addAction(act_ren)
+        menu.addSeparator()
+        menu.addAction(act_mk)
         menu.exec(pane.tree.viewport().mapToGlobal(pos))
 
     def _ctx_send_from_pane(self, pane: SidePane) -> None:
@@ -949,6 +1008,54 @@ class MainWindow(QMainWindow):
                         if not sf:
                             raise RuntimeError("未连接")
                         sf.rename(old_path, new_path)
+            except Exception as e:
+                err = str(e)
+            self._msg_queue.put(("pane_file_ops_done", (pane, err)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ctx_new_folder_in_pane(self, pane: SidePane, paths: list[tuple[str, bool]]) -> None:
+        parent = self._parent_dir_for_new_folder(pane, paths)
+        if parent is None:
+            QMessageBox.warning(
+                self,
+                "新建文件夹",
+                "无法确定目标目录（请检查当前路径是否为有效目录，或 SSH 是否已连接）。",
+            )
+            return
+        name, ok = QInputDialog.getText(
+            self, "新建文件夹", "文件夹名称：", text="新建文件夹"
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name or name in (".", ".."):
+            QMessageBox.warning(self, "新建文件夹", "名称无效")
+            return
+        if any(sep in name for sep in ("/", "\\")):
+            QMessageBox.warning(self, "新建文件夹", "名称中不能包含路径分隔符")
+            return
+
+        if pane.local_checked():
+            new_path = os.path.normpath(os.path.join(parent, name))
+        else:
+            new_path = posixpath.join(parent, name)
+
+        def work() -> None:
+            err: str | None = None
+            try:
+                if pane.local_checked():
+                    os.mkdir(new_path)
+                else:
+                    with self._io_lock:
+                        sf = pane.sftp
+                        if not sf:
+                            raise RuntimeError("未连接")
+                        sf.mkdir(new_path)
+            except FileExistsError:
+                err = f"已存在：{new_path}"
+            except OSError as e:
+                err = str(e)
             except Exception as e:
                 err = str(e)
             self._msg_queue.put(("pane_file_ops_done", (pane, err)))
