@@ -15,11 +15,12 @@ import shutil
 import stat
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -121,6 +122,15 @@ XFER_JOB_COL_SPEED = 5
 XFER_JOB_COL_PROGRESS = 6
 XFER_JOB_COL_STATE = 7
 XFER_JOB_COL_ACTION = 8
+
+# 传输表 insertRow 分块大小；目录下文件极多时避免主线程长时间阻塞
+XFER_TABLE_INSERT_CHUNK = 100
+# 「清除已完成」每次最多 removeRow 次数，避免主线程长时间阻塞
+CLEAR_DONE_ROWS_CHUNK = 150
+# 准备阶段后台线程每累计 N 个文件向 UI 汇报一次，避免海量目录时界面长时间无反馈
+XFER_PREP_SCAN_REPORT_INTERVAL = 2000
+# 超过该文件数时提示「建议压缩后再传输」，由用户选择继续或取消
+XFER_LARGE_BATCH_FILE_THRESHOLD = 300
 
 # 与 main.py 同目录的 JSON，存放常用 SSH 设备（密码为明文，请妥善保管文件权限）
 HOSTS_CONFIG_FILENAME = "hosts.json"
@@ -266,6 +276,8 @@ class SidePane(QWidget):
         self.is_local = False
         self.ssh: paramiko.SSHClient | None = None
         self.sftp: paramiko.SFTPClient | None = None
+        # 与 sftp 并行的数据通道：大文件传输专用，避免与 listdir/stat 在同一条 SFTP 上交错导致外网高延迟时卡顿
+        self.sftp_xfer: paramiko.SFTPClient | None = None
         self._main: MainWindow | None = None
 
         root = QVBoxLayout(self)
@@ -469,12 +481,15 @@ class SidePane(QWidget):
             self._main.save_host_preset_from_pane(self)
 
     def set_xfer_button(self, text: str, slot) -> None:
-        try:
-            self.btn_xfer.clicked.disconnect()
-        except TypeError:
-            pass
+        prev = getattr(self.btn_xfer, "_lf_clicked_conn", None)
+        if prev is not None:
+            try:
+                QObject.disconnect(prev)
+            except TypeError:
+                pass
+            self.btn_xfer._lf_clicked_conn = None
         self.btn_xfer.setText(text)
-        self.btn_xfer.clicked.connect(slot)
+        self.btn_xfer._lf_clicked_conn = self.btn_xfer.clicked.connect(slot)
 
     def _browse_key(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择私钥文件")
@@ -508,14 +523,27 @@ class SidePane(QWidget):
         self.lbl_sel.setText(f"{n} 个对象被选定")
 
     def close_remote(self) -> None:
-        for c in (self.sftp, self.ssh):
-            if c is not None:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-        self.sftp = None
-        self.ssh = None
+        xf, sf, sh = self.sftp_xfer, self.sftp, self.ssh
+        self.sftp_xfer = self.sftp = self.ssh = None
+        if xf is not None and xf is not sf:
+            try:
+                xf.close()
+            except Exception:
+                pass
+        if sf is not None:
+            try:
+                sf.close()
+            except Exception:
+                pass
+        if sh is not None:
+            try:
+                sh.close()
+            except Exception:
+                pass
+
+    def sftp_for_data(self) -> paramiko.SFTPClient | None:
+        """传输 open/read/write 使用；与列表用的 sftp 分离（若服务端只允许单通道则与 sftp 相同）。"""
+        return self.sftp_xfer if self.sftp_xfer is not None else self.sftp
 
     def local_checked(self) -> bool:
         idx = self.combo_hosts.currentIndex()
@@ -582,6 +610,12 @@ class MainWindow(QMainWindow):
         self._xfer_abort_lock = threading.Lock()
         self._xfer_abort_job_id: str | None = None
         self._devices: list[dict[str, Any]] = load_host_devices()
+        # 大批量任务：主线程分块插入表格，避免一次性 insertRow 数万次卡死 UI
+        self._batch_ui_queue: deque[Any] = deque()
+        self._batch_ui_insert_state: dict[str, Any] | None = None
+        # 清除已完成：分块删行，避免海量行时 UI 卡死
+        self._clear_done_rows: list[int] | None = None
+        self._clear_done_ptr: int = 0
 
         cw = QWidget()
         self.setCentralWidget(cw)
@@ -607,11 +641,11 @@ class MainWindow(QMainWindow):
         jl = QVBoxLayout(jobs)
         topj = QHBoxLayout()
         self.lbl_job_summary = QLabel("就绪")
-        btn_clear = QPushButton("清除已完成")
-        btn_clear.clicked.connect(self._clear_done_jobs)
+        self.btn_clear_done = QPushButton("清除已完成")
+        self.btn_clear_done.clicked.connect(self._clear_done_jobs)
         topj.addWidget(self.lbl_job_summary)
         topj.addStretch()
-        topj.addWidget(btn_clear)
+        topj.addWidget(self.btn_clear_done)
         jl.addLayout(topj)
 
         self.table_jobs = QTableWidget(0, 9)
@@ -813,7 +847,11 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
 
         paths = pane.selected_paths()
-        can_mkdir = bool(pane.local_checked() or pane.sftp is not None)
+        can_mkdir = bool(
+            pane.local_checked()
+            or pane.sftp is not None
+            or pane.sftp_xfer is not None
+        )
         parent_for_mkdir = (
             self._parent_dir_for_new_folder(pane, paths) if can_mkdir else None
         )
@@ -1062,6 +1100,107 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _enqueue_batch_ui_insert(
+        self,
+        batch_id: str,
+        job_rows: list[tuple[str, str, int, str, str]],
+        src: SidePane,
+        dst: SidePane,
+        sl: bool,
+        dl: bool,
+    ) -> None:
+        self._batch_ui_queue.append((batch_id, job_rows, src, dst, sl, dl))
+        self._batch_ui_queue_try_start()
+
+    def _batch_ui_queue_try_start(self) -> None:
+        if self._batch_ui_insert_state is not None:
+            return
+        if not self._batch_ui_queue:
+            return
+        bid, rows, src, dst, sl, dl = self._batch_ui_queue.popleft()
+        log_src = _xfer_log_endpoint(src)
+        log_dst = _xfer_log_endpoint(dst)
+        route_txt = f"{src.label} → {dst.label}"
+        self._batch_ui_insert_state = {
+            "batch_id": bid,
+            "rows": rows,
+            "i": 0,
+            "src": src,
+            "dst": dst,
+            "sl": sl,
+            "dl": dl,
+            "log_src": log_src,
+            "log_dst": log_dst,
+            "route_txt": route_txt,
+        }
+        self.table_jobs.setUpdatesEnabled(False)
+        self._batch_ui_insert_chunk()
+
+    def _batch_ui_insert_chunk(self) -> None:
+        st = self._batch_ui_insert_state
+        if st is None:
+            return
+        rows: list[tuple[str, str, int, str, str]] = st["rows"]
+        n = len(rows)
+        i: int = st["i"]
+        end = min(i + XFER_TABLE_INSERT_CHUNK, n)
+        batch_id = st["batch_id"]
+        src: SidePane = st["src"]
+        dst: SidePane = st["dst"]
+        sl: bool = st["sl"]
+        dl: bool = st["dl"]
+        log_src = st["log_src"]
+        log_dst = st["log_dst"]
+        route_txt = st["route_txt"]
+        for k in range(i, end):
+            jid, name, fsz, sp, dp = rows[k]
+            row = self.table_jobs.rowCount()
+            self.table_jobs.insertRow(row)
+            it0 = QTableWidgetItem(name)
+            it0.setData(ROLE_JOB_ID, jid)
+            it0.setData(ROLE_BATCH_ID, batch_id)
+            it0.setData(
+                ROLE_XFER_DIR, "out_to_in" if src is self.pane_out else "in_to_out"
+            )
+            it0.setData(ROLE_XFER_SP, sp)
+            it0.setData(ROLE_XFER_DP, dp)
+            it0.setData(ROLE_XFER_LOG_SRC, log_src)
+            it0.setData(ROLE_XFER_LOG_DST, log_dst)
+            it0.setToolTip(sp)
+            self.table_jobs.setItem(row, XFER_JOB_COL_NAME, it0)
+            self.table_jobs.setItem(
+                row, XFER_JOB_COL_ROUTE, QTableWidgetItem(route_txt)
+            )
+            self.table_jobs.setItem(
+                row, XFER_JOB_COL_SIZE, QTableWidgetItem(_format_size(fsz))
+            )
+            self.table_jobs.setItem(
+                row, XFER_JOB_COL_DONE, QTableWidgetItem(_format_size(0))
+            )
+            self.table_jobs.setItem(
+                row, XFER_JOB_COL_TIME, QTableWidgetItem("00:00:00")
+            )
+            self.table_jobs.setItem(row, XFER_JOB_COL_SPEED, QTableWidgetItem("—"))
+            self._attach_row_progress_bar(row)
+            self.table_jobs.setItem(
+                row, XFER_JOB_COL_STATE, QTableWidgetItem("等待传输")
+            )
+            self._attach_row_action_button(row, jid)
+        st["i"] = end
+        if end < n:
+            self.lbl_job_summary.setText(
+                f"加载传输列表… {end}/{n}（{batch_id}）"
+            )
+            QTimer.singleShot(0, self._batch_ui_insert_chunk)
+            return
+        self.table_jobs.setUpdatesEnabled(True)
+        self._xfer_queue.put((batch_id, rows, src, dst, sl, dl))
+        self._append_log(
+            f"批次 {batch_id} 已就绪：{log_src} → {log_dst}，共 {len(rows)} 个文件待传"
+        )
+        self._batch_ui_insert_state = None
+        self._batch_ui_queue_try_start()
+
     def _poll_queue(self) -> None:
         try:
             while True:
@@ -1074,47 +1213,41 @@ class MainWindow(QMainWindow):
                 elif kind == "list_ready":
                     pane, entries = payload
                     self._fill_tree(pane, entries)
+                elif kind == "xfer_prep_scan":
+                    bid, cnt = payload
+                    self.lbl_job_summary.setText(
+                        f"批次 {bid} 扫描目录… 已发现 {cnt} 个文件"
+                    )
+                elif kind == "xfer_large_batch_confirm":
+                    (
+                        batch_id,
+                        n_files,
+                        done_ev,
+                        confirmed_holder,
+                    ) = payload
+                    mb = QMessageBox(self)
+                    mb.setIcon(QMessageBox.Icon.Warning)
+                    mb.setWindowTitle("传输确认")
+                    mb.setText(
+                        f"本次将传输 {n_files} 个文件（超过 "
+                        f"{XFER_LARGE_BATCH_FILE_THRESHOLD} 个）。"
+                    )
+                    mb.setInformativeText(
+                        "文件数量较多，列表加载与传输可能较慢。建议将目录打包压缩后再传输；"
+                        "若仍要按文件逐个传输，请点击「继续传输」。"
+                    )
+                    btn_go = mb.addButton("继续传输", QMessageBox.ButtonRole.AcceptRole)
+                    btn_cancel = mb.addButton(
+                        "取消传输", QMessageBox.ButtonRole.RejectRole
+                    )
+                    mb.setDefaultButton(btn_cancel)
+                    mb.exec()
+                    confirmed_holder[0] = mb.clickedButton() is btn_go
+                    done_ev.set()
                 elif kind == "batch_prepared":
                     batch_id, job_rows, src, dst, sl, dl = payload
-                    route_txt = f"{src.label} → {dst.label}"
-                    log_src = _xfer_log_endpoint(src)
-                    log_dst = _xfer_log_endpoint(dst)
-                    for jid, name, fsz, sp, dp in job_rows:
-                        row = self.table_jobs.rowCount()
-                        self.table_jobs.insertRow(row)
-                        it0 = QTableWidgetItem(name)
-                        it0.setData(ROLE_JOB_ID, jid)
-                        it0.setData(ROLE_BATCH_ID, batch_id)
-                        it0.setData(ROLE_XFER_DIR, "out_to_in" if src is self.pane_out else "in_to_out")
-                        it0.setData(ROLE_XFER_SP, sp)
-                        it0.setData(ROLE_XFER_DP, dp)
-                        it0.setData(ROLE_XFER_LOG_SRC, log_src)
-                        it0.setData(ROLE_XFER_LOG_DST, log_dst)
-                        it0.setToolTip(sp)
-                        self.table_jobs.setItem(row, XFER_JOB_COL_NAME, it0)
-                        self.table_jobs.setItem(
-                            row, XFER_JOB_COL_ROUTE, QTableWidgetItem(route_txt)
-                        )
-                        self.table_jobs.setItem(
-                            row, XFER_JOB_COL_SIZE, QTableWidgetItem(_format_size(fsz))
-                        )
-                        self.table_jobs.setItem(
-                            row, XFER_JOB_COL_DONE, QTableWidgetItem(_format_size(0))
-                        )
-                        self.table_jobs.setItem(
-                            row, XFER_JOB_COL_TIME, QTableWidgetItem("00:00:00")
-                        )
-                        self.table_jobs.setItem(
-                            row, XFER_JOB_COL_SPEED, QTableWidgetItem("—")
-                        )
-                        self._attach_row_progress_bar(row)
-                        self.table_jobs.setItem(
-                            row, XFER_JOB_COL_STATE, QTableWidgetItem("等待传输")
-                        )
-                        self._attach_row_action_button(row, jid)
-                    self._xfer_queue.put((batch_id, job_rows, src, dst, sl, dl))
-                    self._append_log(
-                        f"批次 {batch_id} 已就绪：{log_src} → {log_dst}，共 {len(job_rows)} 个文件待传"
+                    self._enqueue_batch_ui_insert(
+                        batch_id, job_rows, src, dst, sl, dl
                     )
                 elif kind == "xfer_prep_aborted":
                     idle = self._xfer_decrement_pending()
@@ -1334,20 +1467,23 @@ class MainWindow(QMainWindow):
             btn.setEnabled(False)
             return
         txt = st.text()
-        try:
-            btn.clicked.disconnect()
-        except TypeError:
-            pass
+        prev = getattr(btn, "_lf_action_conn", None)
+        if prev is not None:
+            try:
+                QObject.disconnect(prev)
+            except TypeError:
+                pass
+            btn._lf_action_conn = None
         if txt in ("已中止", "已取消"):
             btn.setText("重传")
             btn.setEnabled(True)
-            btn.clicked.connect(
+            btn._lf_action_conn = btn.clicked.connect(
                 lambda _checked=False, j=job_id: self._on_retransmit_job(j)
             )
         elif txt in ("等待传输", "传输中"):
             btn.setText("删除")
             btn.setEnabled(True)
-            btn.clicked.connect(
+            btn._lf_action_conn = btn.clicked.connect(
                 lambda _checked=False, j=job_id: self._on_remove_transfer_job(j)
             )
         else:
@@ -1419,21 +1555,57 @@ class MainWindow(QMainWindow):
         self.table_jobs.removeRow(row)
 
     def _clear_done_jobs(self) -> None:
+        if self._clear_done_rows is not None:
+            return
+        to_remove: list[int] = []
         for row in range(self.table_jobs.rowCount() - 1, -1, -1):
             it = self.table_jobs.item(row, XFER_JOB_COL_STATE)
-            if it:
-                st = it.text()
-                if (
-                    "成功" in st
-                    or "失败" in st
-                    or "取消" in st
-                    or st == "已移除"
-                    or st == "已中止"
-                    or st == "已跳过"
-                ):
-                    self.table_jobs.removeCellWidget(row, XFER_JOB_COL_PROGRESS)
-                    self.table_jobs.removeCellWidget(row, XFER_JOB_COL_ACTION)
-                    self.table_jobs.removeRow(row)
+            if not it:
+                continue
+            st = it.text()
+            if (
+                "成功" in st
+                or "失败" in st
+                or "取消" in st
+                or st == "已移除"
+                or st == "已中止"
+                or st == "已跳过"
+            ):
+                to_remove.append(row)
+        if not to_remove:
+            return
+        self._clear_done_rows = to_remove
+        self._clear_done_ptr = 0
+        self.btn_clear_done.setEnabled(False)
+        self.lbl_job_summary.setText(
+            f"正在清除已完成… 0/{len(to_remove)}"
+        )
+        self.table_jobs.setUpdatesEnabled(False)
+        self._clear_done_jobs_chunk()
+
+    def _clear_done_jobs_chunk(self) -> None:
+        rows = self._clear_done_rows
+        if rows is None:
+            return
+        ptr = self._clear_done_ptr
+        n = len(rows)
+        end = min(ptr + CLEAR_DONE_ROWS_CHUNK, n)
+        for k in range(ptr, end):
+            row = rows[k]
+            self.table_jobs.removeCellWidget(row, XFER_JOB_COL_PROGRESS)
+            self.table_jobs.removeCellWidget(row, XFER_JOB_COL_ACTION)
+            self.table_jobs.removeRow(row)
+        self._clear_done_ptr = end
+        self.lbl_job_summary.setText(f"正在清除已完成… {end}/{n}")
+        if end < n:
+            QTimer.singleShot(0, self._clear_done_jobs_chunk)
+            return
+        self._clear_done_rows = None
+        self._clear_done_ptr = 0
+        self.table_jobs.setUpdatesEnabled(True)
+        self.btn_clear_done.setEnabled(True)
+        if not self.btn_cancel_xfer.isEnabled():
+            self.lbl_job_summary.setText("就绪")
 
     def _skip_remaining_waiting_in_batch(self, batch_id: str) -> None:
         n = 0
@@ -1584,7 +1756,7 @@ class MainWindow(QMainWindow):
             "hostname": host,
             "port": port,
             "username": user,
-            "timeout": 30,
+            "timeout": 60,
             "allow_agent": True,
             "look_for_keys": True,
         }
@@ -1593,6 +1765,10 @@ class MainWindow(QMainWindow):
         if key_path:
             kw["key_filename"] = [key_path]
         client.connect(**kw)
+        tr = client.get_transport()
+        if tr is not None:
+            # 外网 / NAT 下减少「长时间无包」被中间设备掐断；对局域网影响很小
+            tr.set_keepalive(30)
         return client
 
     def _apply_remote_path_after_connect(
@@ -1644,8 +1820,13 @@ class MainWindow(QMainWindow):
                     pane.close_remote()
                     ssh = self._connect_ssh(host, port, user, pw, key)
                     sftp = ssh.open_sftp()
+                    try:
+                        sftp_xfer = ssh.open_sftp()
+                    except Exception:
+                        sftp_xfer = sftp
                     pane.ssh = ssh
                     pane.sftp = sftp
+                    pane.sftp_xfer = sftp_xfer
                 self._msg_queue.put(("log", f"[{pane.label}] 已连接 {user}@{host}:{port}"))
                 rh = _ssh_remote_home(ssh)
                 self._msg_queue.put(("log", f"[{pane.label}] 远端主目录: {rh}"))
@@ -1659,10 +1840,24 @@ class MainWindow(QMainWindow):
 
     def disconnect_side(self, pane: SidePane) -> None:
         was_local = pane.local_checked()
-        had_ssh = pane.sftp is not None or pane.ssh is not None
+        had_ssh = (
+            pane.sftp is not None
+            or pane.sftp_xfer is not None
+            or pane.ssh is not None
+        )
         ep_ssh = _xfer_log_endpoint(pane) if had_ssh else ""
-        with self._io_lock:
+        if not self._io_lock.acquire(timeout=5.0):
+            QMessageBox.warning(
+                self,
+                "断开",
+                "数据通道暂时无法取得锁（可能正在执行短时 SFTP 操作），请稍后重试；"
+                "若正在传大文件，可先点「取消当前传输」再断开。",
+            )
+            return
+        try:
             pane.close_remote()
+        finally:
+            self._io_lock.release()
         pane.is_local = pane.local_checked()
         if pane.is_local:
             pane.lbl_status.setText("状态：本地模式")
@@ -1753,10 +1948,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "目标路径", "请输入目标侧当前目录")
             return False
 
-        if not dst.local_checked() and not dst.sftp:
+        if not dst.local_checked() and not dst.sftp and not dst.sftp_xfer:
             QMessageBox.critical(self, "目标", "输入端未连接（或启用本地模式）")
             return False
-        if not src.local_checked() and not src.sftp:
+        if not src.local_checked() and not src.sftp and not src.sftp_xfer:
             QMessageBox.critical(self, "来源", "输出端未连接（或启用本地模式）")
             return False
 
@@ -1820,22 +2015,40 @@ class MainWindow(QMainWindow):
         paths: list[tuple[str, bool]],
         src_use_local: bool,
         dst_use_local: bool,
+        scan_progress: tuple[str, int] | None = None,
     ) -> list[tuple[str, str, int]]:
         file_jobs: list[tuple[str, str, int]] = []
+        scan_count = 0
+        bid: str | None = None
+        every = 0
+        if scan_progress is not None:
+            bid, every = scan_progress
+
+        def _report_scan() -> None:
+            if bid is not None and every > 0 and scan_count > 0:
+                if scan_count % every == 0:
+                    self._msg_queue.put(("xfer_prep_scan", (bid, scan_count)))
+
         for src_path, is_dir in paths:
             if is_dir:
-                for fp, dest_rel, sz in self._expand_dir(
+                for fp, dest_rel, sz in self._iter_expand_dir(
                     src, src_path, src_use_local
                 ):
                     dest = self._join_dest(
                         dst, dst_dir, dest_rel, dst_use_local
                     )
                     file_jobs.append((fp, dest, sz))
+                    scan_count += 1
+                    _report_scan()
             else:
                 sz = self._file_size(src, src_path, src_use_local)
                 name = os.path.basename(src_path)
                 dest = self._join_dest(dst, dst_dir, name, dst_use_local)
                 file_jobs.append((src_path, dest, sz))
+                scan_count += 1
+                _report_scan()
+        if bid is not None and scan_count > 0 and (every <= 0 or scan_count % every != 0):
+            self._msg_queue.put(("xfer_prep_scan", (bid, scan_count)))
         return file_jobs
 
     def _prep_batch_worker(
@@ -1850,7 +2063,13 @@ class MainWindow(QMainWindow):
     ) -> None:
         try:
             file_jobs = self._build_file_jobs(
-                src, dst, dst_dir, paths, src_use_local, dst_use_local
+                src,
+                dst,
+                dst_dir,
+                paths,
+                src_use_local,
+                dst_use_local,
+                scan_progress=(batch_id, XFER_PREP_SCAN_REPORT_INTERVAL),
             )
             if not file_jobs:
                 self._msg_queue.put(("log", "没有可传输的文件（目录可能为空）"))
@@ -1862,8 +2081,31 @@ class MainWindow(QMainWindow):
                     self._job_seq += 1
                     jid = f"j{self._job_seq}"
                     job_rows.append((jid, os.path.basename(sp), fsz, sp, dp))
+            n_files = len(job_rows)
+            if n_files > XFER_LARGE_BATCH_FILE_THRESHOLD:
+                done_ev = threading.Event()
+                confirmed_holder: list[bool] = [False]
+                self._msg_queue.put(
+                    (
+                        "xfer_large_batch_confirm",
+                        (batch_id, n_files, done_ev, confirmed_holder),
+                    )
+                )
+                done_ev.wait()
+                if not confirmed_holder[0]:
+                    self._msg_queue.put(
+                        (
+                            "log",
+                            f"批次 {batch_id} 已取消：{n_files} 个文件，用户选择不继续传输",
+                        )
+                    )
+                    self._msg_queue.put(("xfer_prep_aborted", batch_id))
+                    return
             self._msg_queue.put(
-                ("batch_prepared", (batch_id, job_rows, src, dst, src_use_local, dst_use_local))
+                (
+                    "batch_prepared",
+                    (batch_id, job_rows, src, dst, src_use_local, dst_use_local),
+                )
             )
         except Exception as e:
             self._msg_queue.put(("log", f"准备传输列表失败: {e}"))
@@ -1985,10 +2227,19 @@ class MainWindow(QMainWindow):
             self._msg_queue.put(("cancel_batch_waiting_rows", batch_id))
             raise
 
-    def _expand_dir(
+    def _with_browse_sftp(
+        self, pane: SidePane, fn: Callable[[paramiko.SFTPClient], Any]
+    ) -> Any:
+        """在锁内执行仅浏览用的 SFTP 调用；锁外不持有 sftp 引用，避免与关闭并发。"""
+        with self._io_lock:
+            sf = pane.sftp
+            if not sf:
+                return None
+            return fn(sf)
+
+    def _iter_expand_dir(
         self, src: SidePane, root: str, src_use_local: bool
-    ) -> list[tuple[str, str, int]]:
-        out: list[tuple[str, str, int]] = []
+    ) -> Iterator[tuple[str, str, int]]:
         if src_use_local:
             # 必须用 realpath：abspath 不解析符号链接，walk 可能产生与 root 前缀不一致的路径，
             # relpath 会出现 ".."，拼到远端后变成错误路径 → [Errno 2] No such file。
@@ -2020,51 +2271,66 @@ class MainWindow(QMainWindow):
                         continue
                     if not stat.S_ISREG(st.st_mode):
                         continue
-                    out.append((fp_real, dest_rel, st.st_size))
+                    yield (fp_real, dest_rel, st.st_size)
         else:
-            with self._io_lock:
-                if not src.sftp:
-                    return out
-                sftp = src.sftp
-                root_norm = posixpath.normpath(str(root).replace("\\", "/"))
-                try:
-                    rs = sftp.stat(root_norm)
-                    if not stat.S_ISDIR(rs.st_mode):
-                        return out
-                except OSError:
-                    return out
-                base_name = os.path.basename(root_norm.rstrip("/")) or "folder"
+            root_norm = posixpath.normpath(str(root).replace("\\", "/"))
+            rs = self._with_browse_sftp(src, lambda sf: sf.stat(root_norm))
+            if rs is None:
+                return
+            try:
+                if not stat.S_ISDIR(int(rs.st_mode)):
+                    return
+            except (TypeError, ValueError):
+                return
+            base_name = os.path.basename(root_norm.rstrip("/")) or "folder"
 
-                def walk(rpath: str, rel: str) -> None:
-                    for attr in sftp.listdir_attr(rpath):
-                        name = _decode_sftp_name(attr.filename)
-                        if name in (".", ".."):
+            def walk(rpath: str, rel: str) -> Iterator[tuple[str, str, int]]:
+                attrs = self._with_browse_sftp(
+                    src, lambda sf, rp=rpath: list(sf.listdir_attr(rp))
+                )
+                if attrs is None:
+                    return
+                for attr in attrs:
+                    name = _decode_sftp_name(attr.filename)
+                    if name in (".", ".."):
+                        continue
+                    full = posixpath.join(rpath, name)
+                    m0 = attr.st_mode
+                    if m0 is not None and m0 != 0:
+                        mode = int(m0)
+                    else:
+                        st0 = self._with_browse_sftp(
+                            src, lambda sf, f=full: sf.stat(f)
+                        )
+                        if st0 is None:
                             continue
-                        full = posixpath.join(rpath, name)
-                        mode = _resolve_remote_mode(sftp, full, attr)
-                        if stat.S_ISLNK(mode):
-                            try:
-                                st = sftp.stat(full)
-                                mode = int(st.st_mode)
-                            except OSError:
-                                continue
-                        if stat.S_ISDIR(mode):
-                            nrel = posixpath.join(rel, name) if rel else name
-                            walk(full, nrel)
-                        elif stat.S_ISREG(mode):
-                            sz = int(attr.st_size or 0)
-                            if sz == 0:
-                                try:
-                                    sz = int(sftp.stat(full).st_size)
-                                except OSError:
-                                    sz = 0
-                            rel_file = posixpath.join(rel, name) if rel else name
-                            out.append(
-                                (full, posixpath.join(base_name, rel_file), sz)
+                        mode = int(st0.st_mode)
+                    if stat.S_ISLNK(mode):
+                        st = self._with_browse_sftp(
+                            src, lambda sf, f=full: sf.stat(f)
+                        )
+                        if st is None:
+                            continue
+                        mode = int(st.st_mode)
+                    if stat.S_ISDIR(mode):
+                        nrel = posixpath.join(rel, name) if rel else name
+                        yield from walk(full, nrel)
+                    elif stat.S_ISREG(mode):
+                        sz = int(attr.st_size or 0)
+                        if sz == 0:
+                            st2 = self._with_browse_sftp(
+                                src, lambda sf, f=full: sf.stat(f)
                             )
+                            if st2 is not None:
+                                sz = int(st2.st_size)
+                        rel_file = posixpath.join(rel, name) if rel else name
+                        yield (
+                            full,
+                            posixpath.join(base_name, rel_file),
+                            sz,
+                        )
 
-                walk(root_norm, "")
-        return out
+            yield from walk(root_norm, "")
 
     def _file_size(self, src: SidePane, path: str, src_use_local: bool) -> int:
         if src_use_local:
@@ -2163,66 +2429,103 @@ class MainWindow(QMainWindow):
                 sent += len(chunk)
                 on_chunk(sent, total)
 
+        # 不在整块读写期间持有 _io_lock：否则「刷新 / 改路径 / 断开」等会长时间阻塞 UI。
+        # 仅在打开远端文件、mkdir 等短时 SFTP 操作时持锁；pump 期间其它线程可 listdir。
+        if self._cancel_event.is_set():
+            raise InterruptedError("已取消")
+
+        if sl and dl:
+            sp_abs = os.path.normpath(
+                os.path.abspath(os.path.expanduser(str(src_path)))
+            )
+            dp_abs = os.path.normpath(
+                os.path.abspath(os.path.expanduser(str(dst_path)))
+            )
+            self._ensure_local_parent(dp_abs)
+            if not os.path.isfile(sp_abs):
+                raise FileNotFoundError(
+                    f"本地源不是普通文件或不存在: {sp_abs!r}"
+                )
+            with open(sp_abs, "rb") as rf, open(dp_abs, "wb") as wf:
+                pump(rf, wf)
+            return
+
+        if sl and not dl:
+            assert dst.sftp_for_data() is not None
+            sp_abs = os.path.normpath(
+                os.path.abspath(os.path.expanduser(str(src_path)))
+            )
+            rp = posixpath.normpath(str(dst_path).replace("\\", "/"))
+            if not posixpath.isabs(rp):
+                raise OSError(f"远程目标必须是绝对路径: {rp!r}")
+            if not os.path.isfile(sp_abs):
+                raise FileNotFoundError(
+                    f"本地源不是普通文件或不存在: {sp_abs!r}"
+                )
+            sfd = dst.sftp_for_data()
+            with self._io_lock:
+                if self._cancel_event.is_set():
+                    raise InterruptedError("已取消")
+                self._remote_makedirs(sfd, posixpath.dirname(rp))
+                wf = sfd.open(rp, "wb")
+            try:
+                with open(sp_abs, "rb") as rf:
+                    pump(rf, wf)
+            finally:
+                with self._io_lock:
+                    try:
+                        wf.close()
+                    except Exception:
+                        pass
+            return
+
+        if not sl and dl:
+            assert src.sftp_for_data() is not None
+            sp_r = posixpath.normpath(str(src_path).replace("\\", "/"))
+            dp_abs = os.path.normpath(
+                os.path.abspath(os.path.expanduser(str(dst_path)))
+            )
+            if not posixpath.isabs(sp_r):
+                raise OSError(f"远程源路径必须是绝对路径: {sp_r!r}")
+            sfd = src.sftp_for_data()
+            with self._io_lock:
+                if self._cancel_event.is_set():
+                    raise InterruptedError("已取消")
+                self._ensure_local_parent(dp_abs)
+                rf = sfd.open(sp_r, "rb")
+            try:
+                with open(dp_abs, "wb") as wf:
+                    pump(rf, wf)
+            finally:
+                with self._io_lock:
+                    try:
+                        rf.close()
+                    except Exception:
+                        pass
+            return
+
+        assert src.sftp_for_data() is not None and dst.sftp_for_data() is not None
+        sp_r = posixpath.normpath(str(src_path).replace("\\", "/"))
+        rp = posixpath.normpath(str(dst_path).replace("\\", "/"))
+        if not posixpath.isabs(sp_r) or not posixpath.isabs(rp):
+            raise OSError(f"远程路径必须为绝对路径: src={sp_r!r} dst={rp!r}")
+        sfd_d = dst.sftp_for_data()
+        sfd_s = src.sftp_for_data()
         with self._io_lock:
             if self._cancel_event.is_set():
                 raise InterruptedError("已取消")
-            if sl and dl:
-                sp_abs = os.path.normpath(
-                    os.path.abspath(os.path.expanduser(str(src_path)))
-                )
-                dp_abs = os.path.normpath(
-                    os.path.abspath(os.path.expanduser(str(dst_path)))
-                )
-                self._ensure_local_parent(dp_abs)
-                if not os.path.isfile(sp_abs):
-                    raise FileNotFoundError(
-                        f"本地源不是普通文件或不存在: {sp_abs!r}"
-                    )
-                with open(sp_abs, "rb") as rf, open(dp_abs, "wb") as wf:
-                    pump(rf, wf)
-                return
-
-            if sl and not dl:
-                assert dst.sftp is not None
-                sp_abs = os.path.normpath(
-                    os.path.abspath(os.path.expanduser(str(src_path)))
-                )
-                rp = posixpath.normpath(str(dst_path).replace("\\", "/"))
-                if not posixpath.isabs(rp):
-                    raise OSError(f"远程目标必须是绝对路径: {rp!r}")
-                if not os.path.isfile(sp_abs):
-                    raise FileNotFoundError(
-                        f"本地源不是普通文件或不存在: {sp_abs!r}"
-                    )
-                self._remote_makedirs(dst.sftp, posixpath.dirname(rp))
-                with open(sp_abs, "rb") as rf:
-                    with dst.sftp.open(rp, "wb") as wf:
-                        pump(rf, wf)
-                return
-
-            if not sl and dl:
-                assert src.sftp is not None
-                sp_r = posixpath.normpath(str(src_path).replace("\\", "/"))
-                dp_abs = os.path.normpath(
-                    os.path.abspath(os.path.expanduser(str(dst_path)))
-                )
-                if not posixpath.isabs(sp_r):
-                    raise OSError(f"远程源路径必须是绝对路径: {sp_r!r}")
-                self._ensure_local_parent(dp_abs)
-                with src.sftp.open(sp_r, "rb") as rf:
-                    with open(dp_abs, "wb") as wf:
-                        pump(rf, wf)
-                return
-
-            assert src.sftp is not None and dst.sftp is not None
-            sp_r = posixpath.normpath(str(src_path).replace("\\", "/"))
-            rp = posixpath.normpath(str(dst_path).replace("\\", "/"))
-            if not posixpath.isabs(sp_r) or not posixpath.isabs(rp):
-                raise OSError(f"远程路径必须为绝对路径: src={sp_r!r} dst={rp!r}")
-            self._remote_makedirs(dst.sftp, posixpath.dirname(rp))
-            with src.sftp.open(sp_r, "rb") as rf:
-                with dst.sftp.open(rp, "wb") as wf:
-                    pump(rf, wf)
+            self._remote_makedirs(sfd_d, posixpath.dirname(rp))
+            rf = sfd_s.open(sp_r, "rb")
+            wf = sfd_d.open(rp, "wb")
+        try:
+            pump(rf, wf)
+        finally:
+            with self._io_lock:
+                for fh in (rf, wf):
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
 
 
 def main() -> None:

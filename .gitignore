@@ -9,6 +9,6 @@ data/
 *.so
 *vscode
 dist/
-.spec
+*.spec
 *.json
 **hosts**
