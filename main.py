@@ -592,8 +592,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("双端 SCP / SFTP 传输")
-        self.resize(1100, 720)
-        self.setMinimumSize(900, 600)
+        self.resize(1100, 1100)
+        self.setMinimumSize(600, 900)
 
         self._msg_queue: queue.Queue = queue.Queue()
         self._xfer_queue: queue.Queue = queue.Queue()
